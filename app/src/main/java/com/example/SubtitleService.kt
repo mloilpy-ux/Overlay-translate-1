@@ -148,6 +148,7 @@ class SubtitleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedSta
 
     private var tickerJob: Job? = null
     private var lastVoicedLineId = -1
+    private var prefetchJob: Job? = null
     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
 
     private lateinit var prefs: SharedPreferences
@@ -201,6 +202,7 @@ class SubtitleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedSta
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             registerAudioPlaybackListener()
         }
+        startPrefetcher()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -245,6 +247,7 @@ class SubtitleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedSta
             unregisterAudioPlaybackListener()
         }
         stopTicker()
+        stopPrefetcher()
         ttsHelper?.shutdown()
         removeOverlayWindow()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
@@ -325,43 +328,65 @@ class SubtitleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedSta
                     updateNotification("Озвучка готова к воспроизведению: ${resolvedVideoInfo.title}")
                 } else {
                     _serviceState.value = ServiceState.TRANSLATING
-                    Log.d("SubtitleService", "[STEP] Native captions found. Translating ${resolvedVideoInfo.subtitles.size} lines using engine: ${if (isGoogle) "Google Translate" else "Gemini AI"}")
+                    Log.d("SubtitleService", "[STEP] Native captions found. Preparing translation for ${resolvedVideoInfo.subtitles.size} lines using engine: ${if (isGoogle) "Google Translate" else "Gemini AI"}")
                     
-                    if (isGoogle) {
-                        _currentSubtitleText.value = "Перевод при помощи Google Translate (0%)..."
-                        updateNotification("Перевод при помощи Google Translate...")
+                    val allLines = resolvedVideoInfo.subtitles
+                    val limitForInstant = 30
+                    
+                    if (allLines.size <= limitForInstant) {
+                        if (isGoogle) {
+                            _currentSubtitleText.value = "Перевод при помощи Google Translate (0%)..."
+                            updateNotification("Перевод при помощи Google Translate...")
 
-                        val translatedLines = GeminiSubtitleTranslator.translateSubtitlesGoogle(
-                            subtitles = resolvedVideoInfo.subtitles
-                        ) { progress, total ->
-                            val pct = if (total > 0) (progress * 100) / total else 0
-                            _translationProgress.value = pct
-                            _currentSubtitleText.value = "Перевод при помощи Google Translate ($pct%)..."
+                            val translatedLines = GeminiSubtitleTranslator.translateSubtitlesGoogle(
+                                subtitles = allLines
+                            ) { progress, total ->
+                                val pct = if (total > 0) (progress * 100) / total else 0
+                                _translationProgress.value = pct
+                                _currentSubtitleText.value = "Перевод при помощи Google Translate ($pct%)..."
+                            }
+
+                            _videoInfo.value = resolvedVideoInfo.copy(subtitles = translatedLines)
+                        } else {
+                            _currentSubtitleText.value = "Перевод субтитров при помощи Gemini AI (0%)..."
+                            updateNotification("Перевод субтитров при помощи Gemini AI...")
+
+                            val translatedLines = GeminiSubtitleTranslator.translateSubtitles(
+                                subtitles = allLines,
+                                apiKey = apiKey
+                            ) { progress, total ->
+                                val pct = if (total > 0) (progress * 100) / total else 0
+                                _translationProgress.value = pct
+                                _currentSubtitleText.value = "Перевод при помощи Gemini AI ($pct%)..."
+                            }
+
+                            _videoInfo.value = resolvedVideoInfo.copy(subtitles = translatedLines)
                         }
-
-                        _videoInfo.value = resolvedVideoInfo.copy(subtitles = translatedLines)
                     } else {
-                        _currentSubtitleText.value = "Перевод субтитров при помощи Gemini AI (0%)..."
-                        updateNotification("Перевод субтитров при помощи Gemini AI...")
-
-                        val translatedLines = GeminiSubtitleTranslator.translateSubtitles(
-                            subtitles = resolvedVideoInfo.subtitles,
-                            apiKey = apiKey
-                        ) { progress, total ->
-                            val pct = if (total > 0) (progress * 100) / total else 0
-                            _translationProgress.value = pct
-                            _currentSubtitleText.value = "Перевод при помощи Gemini AI ($pct%)..."
+                        // Real-Time JIT Mode: Translate first 15 lines upfront so the user can start instantly!
+                        Log.d("SubtitleService", "[REALTIME] Long captions stream detected (${allLines.size} lines). Enabling fast look-ahead JIT mode.")
+                        _currentSubtitleText.value = "Мгновенный запуск. Перевод первой сцены..."
+                        updateNotification("Перевод первой сцены через AI...")
+                        
+                        val firstBatch = allLines.take(15)
+                        val remainingLines = allLines.drop(15).map { it.copy(translatedText = null) }
+                        
+                        val translatedFirstBatch = if (isGoogle) {
+                            GeminiSubtitleTranslator.translateSubtitlesGoogle(firstBatch) { _, _ -> }
+                        } else {
+                            GeminiSubtitleTranslator.translateSubtitles(firstBatch, apiKey) { _, _ -> }
                         }
-
-                        _videoInfo.value = resolvedVideoInfo.copy(subtitles = translatedLines)
+                        
+                        val combinedLines = translatedFirstBatch + remainingLines
+                        _videoInfo.value = resolvedVideoInfo.copy(subtitles = combinedLines)
                     }
 
                     val finalLines = _videoInfo.value?.subtitles ?: emptyList()
-                    Log.d("SubtitleService", "[STEP] Subtitles translation complete. Total tracks: ${finalLines.size}")
+                    Log.d("SubtitleService", "[STEP] Subtitles translation configured. Total tracks: ${finalLines.size}")
                     _serviceState.value = ServiceState.PAUSED
                     _durationMs.value = finalLines.lastOrNull()?.let { it.startMs + it.durationMs } ?: 0L
-                    _currentSubtitleText.value = "Перевод завершен! Нажмите Play для синхронизации."
-                    updateNotification("Перевод завершен! Готово к воспроизведению")
+                    _currentSubtitleText.value = "Перевод готов! Нажмите Play для синхронизации."
+                    updateNotification("Перевод готов! Готово к воспроизведению")
                 }
             } catch (e: Exception) {
                 Log.e("SubtitleService", "[STEP] Extreme failure loading or translating video url content", e)
@@ -1273,5 +1298,68 @@ class SubtitleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedSta
             }
         }
         playbackCallback = null
+    }
+
+    private fun startPrefetcher() {
+        prefetchJob?.cancel()
+        prefetchJob = serviceScope.launch {
+            Log.d("SubtitleService", "[REALTIME] Starting background translation look-ahead prefetcher loop.")
+            while (isActive) {
+                try {
+                    val state = _serviceState.value
+                    if (state == ServiceState.PLAYING || state == ServiceState.PAUSED) {
+                        val apiKey = BuildConfig.GEMINI_API_KEY
+                        val isGoogle = _selectedTranslationApi.value == "google"
+                        val currentProgress = _currentProgressMs.value
+                        val allSubtitles = _videoInfo.value?.subtitles ?: emptyList()
+                        
+                        // Look ahead for untranslated lines in the next 20 seconds
+                        val upcomingUntranslated = allSubtitles.filter {
+                            it.startMs in currentProgress..(currentProgress + 20000) && it.translatedText == null
+                        }
+                        
+                        if (upcomingUntranslated.isNotEmpty()) {
+                            val chunk = upcomingUntranslated.take(8)
+                            Log.d("SubtitleService", "[REALTIME] Prefetcher detected ${upcomingUntranslated.size} upcoming untranslated lines. Processing batch of ${chunk.size} symbols via ${if (isGoogle) "Google" else "Gemini"}.")
+                            
+                            val translatedBatch = if (isGoogle) {
+                                GeminiSubtitleTranslator.translateSubtitlesGoogle(chunk) { _, _ -> }
+                            } else {
+                                if (apiKey.isNotEmpty() && apiKey != "MY_GEMINI_API_KEY") {
+                                    GeminiSubtitleTranslator.translateSubtitles(chunk, apiKey) { _, _ -> }
+                                } else {
+                                    emptyList()
+                                }
+                            }
+                            
+                            if (translatedBatch.isNotEmpty()) {
+                                updateSubtitleTranslations(translatedBatch)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("SubtitleService", "[REALTIME] Prefetcher error: ${e.message}", e)
+                }
+                delay(2000) // Run every 2 seconds
+            }
+        }
+    }
+
+    private fun stopPrefetcher() {
+        prefetchJob?.cancel()
+        prefetchJob = null
+    }
+
+    private fun updateSubtitleTranslations(translatedLines: List<SubtitleLine>) {
+        val currentVideoInfo = _videoInfo.value ?: return
+        val updatedSubtitles = currentVideoInfo.subtitles.map { existingLine ->
+            val matched = translatedLines.find { it.id == existingLine.id }
+            if (matched != null && matched.translatedText != null) {
+                existingLine.copy(translatedText = matched.translatedText)
+            } else {
+                existingLine
+            }
+        }
+        _videoInfo.value = currentVideoInfo.copy(subtitles = updatedSubtitles)
     }
 }
