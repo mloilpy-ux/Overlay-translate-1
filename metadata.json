@@ -1,0 +1,6 @@
+{
+  "name": "YT Subtitles",
+  "description": "Android background subtitle overlay and voiceover translating YouTube videos & Shorts in real-time using Gemini API and Text-to-Speech.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
