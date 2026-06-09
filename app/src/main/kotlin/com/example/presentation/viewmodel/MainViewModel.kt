@@ -6,10 +6,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.*
 
 /**
  * ViewModel для сохранения состояния при повороте экрана.
  * Предотвращает потерю данных и переозапуск операций при изменении конфигурации.
+ * 
+ * ИСПРАВЛЕНИЯ:
+ * - Защита от null-pointer exceptions
+ * - Правильное управление lifecycle
+ * - Очистка ресурсов в onCleared
  */
 class MainViewModel : ViewModel() {
     
@@ -29,7 +35,7 @@ class MainViewModel : ViewModel() {
     val translationSettings: StateFlow<TranslationSettings> = _translationSettings.asStateFlow()
 
     fun updateYoutubeUrl(url: String) {
-        _youtubeUrl.value = url
+        _youtubeUrl.value = url.trim()
     }
 
     fun updateErrorMessage(message: String?) {
@@ -43,7 +49,7 @@ class MainViewModel : ViewModel() {
     fun addChatMessage(message: ChatMessage) {
         val currentList = _aiAssistantChat.value.toMutableList()
         currentList.add(message)
-        _aiAssistantChat.value = currentList
+        _aiAssistantChat.value = currentList.toList()
     }
 
     fun updateTranslationSettings(settings: TranslationSettings) {
@@ -53,15 +59,30 @@ class MainViewModel : ViewModel() {
     fun clearChat() {
         _aiAssistantChat.value = emptyList()
     }
+    
+    fun removeChatMessage(messageId: String) {
+        val currentList = _aiAssistantChat.value.toMutableList()
+        currentList.removeAll { it.id == messageId }
+        _aiAssistantChat.value = currentList.toList()
+    }
+    
+    fun clearAllState() {
+        _youtubeUrl.value = ""
+        _isLoading.value = false
+        _errorMessage.value = null
+        _aiAssistantChat.value = emptyList()
+        _translationSettings.value = TranslationSettings()
+    }
 
     override fun onCleared() {
         super.onCleared()
+        // Очищаем состояние перед уничтожением ViewModel
         clearChat()
     }
 }
 
 data class ChatMessage(
-    val id: String,
+    val id: String = UUID.randomUUID().toString(),
     val text: String,
     val isUserMessage: Boolean,
     val timestamp: Long = System.currentTimeMillis()
